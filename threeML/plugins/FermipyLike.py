@@ -141,26 +141,24 @@ def _get_fermipy_instance(configuration, likelihood_model):
     # analysis a lot)
     # NOTE: these are going to be absolute paths
 
-    galactic_template = str(
-        sanitize_filename(
-            findGalacticTemplate(irfs, ra_center, dec_center, roi_radius),
-            True,
-        )
-    )
+    #galactic_template = str(
+    #    sanitize_filename(
+    #        findGalacticTemplate(irfs, ra_center, dec_center, roi_radius),
+    #        True,
+    #    )
+    #)
     isotropic_template = str(sanitize_filename(findIsotropicTemplate(irfs), True))
 
     # Add them to the fermipy model
 
-    fermipy_model["galdiff"] = galactic_template
+    #fermipy_model["galdiff"] = galactic_template
     fermipy_model["isodiff"] = isotropic_template
 
     # Now iterate over all sources contained in the likelihood model
     sources = []
 
     # point sources
-    for point_source in list(
-        likelihood_model.point_sources.values()
-    ):  # type: astromodels.PointSource
+    for point_source in list(likelihood_model.point_sources.values()):  # type: astromodels.PointSource
         this_source = {
             "Index": 2.56233,
             "Scale": 572.78,
@@ -220,6 +218,29 @@ def _get_fermipy_instance(configuration, likelihood_model):
             this_source["SpatialModel"] = "SpatialMap"
             this_source["Spatial_Filename"] = theShape._fitsfile
 
+        # My patch for GALPROP:
+        elif theShape.name in ["GalPropTemplate_3D","GalpropFitsMapCube"]:
+
+            try:
+                (ra_min, ra_max), (dec_min, dec_max) = theShape.get_boundaries()
+
+                this_source["ra"] = circmean([ra_min, ra_max] * u.deg).value
+                this_source["dec"] = circmean([dec_min, dec_max] * u.deg).value
+
+            except Exception:
+                log.critical(
+                f"Source {extended_source.name} does not have a GALPROP template file set; "
+                "must call load_file first()")
+
+            this_source["SpatialModel"] = "MapCubeFunction"
+            this_source["SpatialType"] = "MapCubeFunction"
+            this_source["SourceType"] = "DiffuseSource"
+            this_source["Spatial_Filename"] = theShape.which_model_file()
+
+            # Important: the cube already contains the energy dependence.
+            this_source["SpectrumType"] = "PowerLaw"
+            this_source["Value"] = float(theShape.K.value)
+
         else:
             log.critical(
                 f"Extended source {extended_source.name}: shape {theShape.name} not yet"
@@ -276,6 +297,12 @@ def _get_fermipy_instance(configuration, likelihood_model):
     ):  # type: astromodels.ExtendedSource
         # This will substitute the current spectrum with a FileFunction with the same
         # shape and flux
+        
+        theShape = extended_source.spatial_shape
+
+        if theShape.name in ["GalPropTemplate_3D","GalpropFitsMapCube"]:
+            continue
+
         gta.set_source_spectrum(
             extended_source.name, "FileFunction", update_source=False
         )
@@ -300,6 +327,33 @@ def _get_fermipy_instance(configuration, likelihood_model):
         )  # ph / (cm2 s keV)
         dnde_per_MeV = np.maximum(dnde * 1000.0, 1e-300)  # ph / (cm2 s MeV)
         gta.set_source_dnde(extended_source.name, dnde_per_MeV, False)
+
+    # NOW synce Fermipy-side parameters.
+    # Otherwise, every soure in the xml file has free norm, 
+    # and the fit tries to profile over all of them!
+    print("Synchronizing Fermipy-side free parameters with 3ML model...")
+
+    for src in gta.roi.sources:
+
+        src_name = src.name
+        free_this_source = False
+
+        if src_name in likelihood_model.point_sources:
+
+            free_this_source = likelihood_model.point_sources[src_name].has_free_parameters
+
+        elif src_name in likelihood_model.extended_sources:
+
+            ext_src = likelihood_model.extended_sources[src_name]
+            shape = ext_src.spatial_shape
+
+            if shape.name == "GalpropFitsMapCube":
+                # 3ML owns K; Fermipy should not internally optimize it
+                free_this_source = False
+            else:
+                free_this_source = ext_src.has_free_parameters
+
+        gta.free_source(src_name, free=free_this_source)
 
     return gta, energies_keV
 
@@ -633,6 +687,19 @@ class FermipyLike(PluginPrototype):
                 continue
 
             theShape = extended_source.spatial_shape
+            
+            if theShape.name in ["GalPropTemplate_3D","GalpropFitsMapCube"]:
+
+                # 3ML/astromodels owns K.
+                # Fermipy evaluates the mapcube; we only update its scale.
+                self._gta.set_norm(
+                    extended_source.name,
+                    float(theShape.K.value),
+                    update_source=update_dictionary,
+                    )
+
+                continue
+
             if theShape.has_free_parameters or force_update:
                 fermipySource = self._gta.roi.get_source_by_name(extended_source.name)
                 fermipyPars = [
@@ -700,6 +767,10 @@ class FermipyLike(PluginPrototype):
                 elif theShape.name == "SpatialTemplate_2D":
                     # for now, assume we're not updating the fits file
                     pass
+
+                elif theShape.name in ["GalPropTemplate_3D","GalpropFitsMapCube"]:
+                    # for now, assume we're not updating the fits file
+                     pass
 
                 else:
                     # eventually, implement other shapes here.
