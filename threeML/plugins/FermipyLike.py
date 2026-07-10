@@ -219,7 +219,7 @@ def _get_fermipy_instance(configuration, likelihood_model):
             this_source["Spatial_Filename"] = theShape._fitsfile
 
         # My patch for GALPROP:
-        elif theShape.name in ["GalPropTemplate_3D","GalpropFitsMapCube"]:
+        elif theShape.name in ["GalPropTemplate_3D","GalpropMap"]:
 
             try:
                 (ra_min, ra_max), (dec_min, dec_max) = theShape.get_boundaries()
@@ -300,7 +300,7 @@ def _get_fermipy_instance(configuration, likelihood_model):
         
         theShape = extended_source.spatial_shape
 
-        if theShape.name in ["GalPropTemplate_3D","GalpropFitsMapCube"]:
+        if theShape.name in ["GalPropTemplate_3D","GalpropMap"]:
             continue
 
         gta.set_source_spectrum(
@@ -347,7 +347,7 @@ def _get_fermipy_instance(configuration, likelihood_model):
             ext_src = likelihood_model.extended_sources[src_name]
             shape = ext_src.spatial_shape
 
-            if shape.name == "GalpropFitsMapCube":
+            if shape.name == "GalpropMap":
                 # 3ML owns K; Fermipy should not internally optimize it
                 free_this_source = False
             else:
@@ -688,7 +688,7 @@ class FermipyLike(PluginPrototype):
 
             theShape = extended_source.spatial_shape
             
-            if theShape.name in ["GalPropTemplate_3D","GalpropFitsMapCube"]:
+            if theShape.name in ["GalPropTemplate_3D","GalpropMap"]:
 
                 # 3ML/astromodels owns K.
                 # Fermipy evaluates the mapcube; we only update its scale.
@@ -768,7 +768,7 @@ class FermipyLike(PluginPrototype):
                     # for now, assume we're not updating the fits file
                     pass
 
-                elif theShape.name in ["GalPropTemplate_3D","GalpropFitsMapCube"]:
+                elif theShape.name in ["GalPropTemplate_3D","GalpropMap"]:
                     # for now, assume we're not updating the fits file
                      pass
 
