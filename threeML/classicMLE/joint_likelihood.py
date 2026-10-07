@@ -383,18 +383,12 @@ class JointLikelihood(object):
 
             total_number_of_data_points += dataset.get_number_of_data_points()
 
-        if not np.isclose(total,self._current_minimum,rtol=1e-8,atol=1e-5):
+        if not np.isclose(total, self._current_minimum, rtol=1e-8, atol=1e-5):
             log.error(
-                    "Current minimum stored after fit (%s) and current (%s) do not correspond!"
-                    % (self._current_minimum, current_minimum))
+                f"Current minimum stored after fit ({self._current_minimum}) and "
+                f"current ({total}) do not correspond!"
+            )
             raise ValueError()
-
-        #if total != self._current_minimum:  # pragma: no cover
-        #    log.error(
-        #        f"Current minimum stored after fit ({self._current_minimum}) and "
-        #        f"current ({total}) do not correspond!"
-        #    )
-        #    raise ValueError()
 
         # compute additional statistics measures
 
@@ -1311,3 +1305,4 @@ class JointLikelihood(object):
         self._assign_model_to_data(self._likelihood_model)
 
         return TS_df
+
