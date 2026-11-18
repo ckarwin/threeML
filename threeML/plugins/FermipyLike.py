@@ -147,6 +147,44 @@ def _is_mapcube(source):
     return source.spatial_shape.name in ("GalPropTemplate_3D", "GalpropMap")
 
 
+
+def _mapcube_tilt(source):
+    """Accept the original unity spectrum or a unity-normalized power-law tilt.
+
+    spatial_shape.K remains the sole amplitude. The spectral Powerlaw is a
+    numerical, dimensionless multiplier of the physical intensity mapcube.
+    """
+    if len(source.components) != 1:
+        raise ValueError("Mapcube sources require exactly one spectral component")
+    spectrum = next(iter(source.components.values())).shape
+    if spectrum.name == "Constant":
+        if spectrum.k.free or spectrum.k.value != 1.0:
+            raise ValueError("Mapcube Constant.k must be fixed at 1; fit spatial_shape.K")
+        return None
+    if spectrum.name == "Powerlaw":
+        if spectrum.K.free or spectrum.K.value != 1.0:
+            raise ValueError("Mapcube Powerlaw.K must be fixed at 1; fit spatial_shape.K")
+        if spectrum.piv.free or not np.isfinite(spectrum.piv.value) or spectrum.piv.value <= 0:
+            raise ValueError("Mapcube Powerlaw.piv must be fixed and positive (keV)")
+        if not np.isfinite(spectrum.index.value):
+            raise ValueError("Mapcube Powerlaw.index must be finite")
+        return spectrum
+    raise ValueError("Mapcube spectra must be Constant(k=1) or Powerlaw(K=1), with fixed amplitude")
+
+
+def _update_mapcube_tilt(gta, source):
+    """Update the native LAT PowerLaw multiplier; do not reweight the cube."""
+    spectrum = _mapcube_tilt(source)
+    if spectrum is None:
+        return  # Preserve the original normalization-only path.
+    # LAT Scale uses MeV; astromodels piv uses keV. Index is the signed
+    # exponent in both models. true_value=True avoids LAT parameter scales.
+    gta.set_parameter(source.name, "Scale", float(spectrum.piv.value) / 1000.0,
+                      true_value=True, update_source=False)
+    gta.set_parameter(source.name, "Index", float(spectrum.index.value),
+                      true_value=True, update_source=False)
+
+
 def _mapcube_filename(source):
     """Validate the direct mapcube path without changing its physical spectrum."""
     shape = source.spatial_shape
@@ -170,19 +208,7 @@ def _mapcube_filename(source):
             )
         if u.Unit(shape._input_energy_unit) != u.keV:
             raise ValueError("FermipyLike requires GalpropMap input_energy_unit=keV")
-    for component in source.components.values():
-        if (
-            component.shape.name != "Constant"
-            or component.shape.k.free
-            or component.shape.k.value != 1.0
-        ):
-            raise ValueError(
-                f"Mapcube source {source.name} requires a fixed Constant(k=1) spectrum; fit spatial_shape.K"
-            )
-    if len(source.components) != 1:
-        raise ValueError(
-            "Mapcube sources require exactly one fixed Constant(k=1) spectrum"
-        )
+    _mapcube_tilt(source)
     return str(sanitize_filename(filename, True))
 
 
@@ -474,7 +500,13 @@ def _get_fermipy_instance(
         dnde = point_source(energies_keV)  # ph / (cm2 s keV)
         dnde_per_MeV = np.maximum(dnde * 1000.0, 1e-300)  # ph / (cm2 s MeV)
         gta.set_source_dnde(point_source.name, dnde_per_MeV, False)
-
+        
+        # Synchronize Fermipy parameter freedom with astromodels
+        gta.free_source(
+            point_source.name,
+            free=point_source.has_free_parameters
+        )
+        
     # Same for extended source
     for extended_source in list(
         likelihood_model.extended_sources.values()
@@ -488,6 +520,7 @@ def _get_fermipy_instance(
         theShape = extended_source.spatial_shape
 
         if _is_mapcube(extended_source):
+            _update_mapcube_tilt(gta, extended_source)
             gta.set_norm_bounds(
                 extended_source.name,
                 (
@@ -1094,7 +1127,8 @@ class FermipyLike(PluginPrototype):
             if _is_mapcube(extended_source):
 
                 # 3ML/astromodels owns K.
-                # Fermipy evaluates the mapcube; we only update its scale.
+                # Fermipy evaluates the mapcube with its optional spectral tilt.
+                _update_mapcube_tilt(self._gta, extended_source)
                 self._gta.set_norm(
                     extended_source.name,
                     float(theShape.K.value),
