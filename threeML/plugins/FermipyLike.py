@@ -1,4 +1,5 @@
 import collections
+import copy
 import os
 from typing import Any, Dict, List, Optional, Union
 
@@ -90,7 +91,210 @@ def _get_unique_tag_from_configuration(configuration):
     return get_unique_deterministic_tag(",".join(string_to_hash))
 
 
-def _get_fermipy_instance(configuration, likelihood_model):
+def _source_names(value, option):
+    """Validate an explicit sequence of shared-model source names."""
+    if isinstance(value, str):
+        raise TypeError(f"{option} must be a sequence of source names, not a string")
+    try:
+        names = tuple(value)
+    except TypeError as error:
+        raise TypeError(f"{option} must be a sequence of source names") from error
+    if any(not isinstance(name, str) or not name for name in names):
+        raise TypeError(f"{option} must contain nonempty source-name strings")
+    if len(set(names)) != len(names):
+        raise ValueError(f"{option} contains duplicate source names")
+    return names
+
+
+def _diffuse_selection(value, option):
+    """Accept 'default', None, or a nonempty sequence of model source names."""
+    if value is None or (isinstance(value, str) and value == "default"):
+        return value
+    names = _source_names(value, option)
+    if not names:
+        raise ValueError(f"Use {option}=None to disable the automatic background")
+    return names
+
+
+def _read_isotropic_spectrum(filename):
+    """Read a native LAT intensity table without changing its normalization."""
+    table = np.loadtxt(filename, usecols=(0, 1), ndmin=2)
+    if (
+        len(table) < 2
+        or not np.all(np.isfinite(table))
+        or np.any(table <= 0)
+        or np.any(np.diff(table[:, 0]) <= 0)
+    ):
+        raise ValueError(
+            "The isotropic spectrum needs at least two rows of finite, positive "
+            "energies and intensities, with strictly increasing energies"
+        )
+    return table
+
+
+def _prepare_isotropic_spectrum(filename, configuration):
+    """Stage a two-column .txt file for Fermipy's native isotropic loader."""
+    table = _read_isotropic_spectrum(filename)
+    tag = get_unique_deterministic_tag(repr(table.tolist()))
+    outdir = str(sanitize_filename(configuration["fileio"]["outdir"], True))
+    os.makedirs(outdir, exist_ok=True)
+    staged = os.path.join(outdir, f"isodiff_{tag}.txt")
+    np.savetxt(staged, table, fmt="%.18e")
+    return staged
+
+
+def _is_mapcube(source):
+    return source.spatial_shape.name in ("GalPropTemplate_3D", "GalpropMap")
+
+
+
+def _mapcube_tilt(source):
+    """Accept the original unity spectrum or a unity-normalized power-law tilt.
+
+    spatial_shape.K remains the sole amplitude. The spectral Powerlaw is a
+    numerical, dimensionless multiplier of the physical intensity mapcube.
+    """
+    if len(source.components) != 1:
+        raise ValueError("Mapcube sources require exactly one spectral component")
+    spectrum = next(iter(source.components.values())).shape
+    if spectrum.name == "Constant":
+        if spectrum.k.free or spectrum.k.value != 1.0:
+            raise ValueError("Mapcube Constant.k must be fixed at 1; fit spatial_shape.K")
+        return None
+    if spectrum.name == "Powerlaw":
+        if spectrum.K.free or spectrum.K.value != 1.0:
+            raise ValueError("Mapcube Powerlaw.K must be fixed at 1; fit spatial_shape.K")
+        if spectrum.piv.free or not np.isfinite(spectrum.piv.value) or spectrum.piv.value <= 0:
+            raise ValueError("Mapcube Powerlaw.piv must be fixed and positive (keV)")
+        if not np.isfinite(spectrum.index.value):
+            raise ValueError("Mapcube Powerlaw.index must be finite")
+        return spectrum
+    raise ValueError("Mapcube spectra must be Constant(k=1) or Powerlaw(K=1), with fixed amplitude")
+
+
+def _update_mapcube_tilt(gta, source):
+    """Update the native LAT PowerLaw multiplier; do not reweight the cube."""
+    spectrum = _mapcube_tilt(source)
+    if spectrum is None:
+        return  # Preserve the original normalization-only path.
+    # LAT Scale uses MeV; astromodels piv uses keV. Index is the signed
+    # exponent in both models. true_value=True avoids LAT parameter scales.
+    gta.set_parameter(source.name, "Scale", float(spectrum.piv.value) / 1000.0,
+                      true_value=True, update_source=False)
+    gta.set_parameter(source.name, "Index", float(spectrum.index.value),
+                      true_value=True, update_source=False)
+
+
+def _mapcube_filename(source):
+    """Validate the direct mapcube path without changing its physical spectrum."""
+    shape = source.spatial_shape
+    filename = shape.which_model_file()
+    if filename is None or not os.path.isfile(filename):
+        raise ValueError(
+            f"Load a WCS mapcube for source {source.name} before attaching the model"
+        )
+    if shape.name == "GalpropMap":
+        if shape._region is not None:
+            raise ValueError(
+                "A region-masked GalpropMap cannot use an unmasked LAT mapcube; use a separate SPI integration region"
+            )
+        if (
+            shape._map_is_e2_dnde
+            or shape._ihdu != 0
+            or u.Unit(shape._fits_energy_unit) != u.MeV
+        ):
+            raise ValueError(
+                "LAT mapcubes must contain dN/dE per MeV in the primary HDU; convert the file before loading it"
+            )
+        if u.Unit(shape._input_energy_unit) != u.keV:
+            raise ValueError("FermipyLike requires GalpropMap input_energy_unit=keV")
+    _mapcube_tilt(source)
+    return str(sanitize_filename(filename, True))
+
+
+def _isotropic_config(source, configuration):
+    """Write the intensity spectrum needed to initialize a Fermipy IsoSource."""
+    # Use a dense grid for analytic models, and retain every knot of tabulated
+    # spectra. FileFunction interpolates logarithmically between its samples.
+    components = configuration.get("components") or []
+    if isinstance(components, dict):
+        components = list(components.values())
+    from fermipy.defaults import gtlike as gtlike_defaults
+
+    bounds = []
+    for component in components or [{}]:
+        selection = dict(configuration["selection"], **component.get("selection", {}))
+        binning = dict(configuration["binning"], **component.get("binning", {}))
+        gtlike = dict(configuration.get("gtlike", {}), **component.get("gtlike", {}))
+        emin, emax = float(selection["emin"]), float(selection["emax"])
+        if not 0 < emin < emax:
+            raise ValueError("The LAT energy selection must satisfy 0 < emin < emax")
+        if gtlike.get("edisp", gtlike_defaults["edisp"][0]):
+            # Include a conservative true-energy margin around the measured band.
+            padding = (
+                abs(int(gtlike.get("edisp_bins", gtlike_defaults["edisp_bins"][0]))) + 2
+            ) / float(binning["binsperdec"])
+            emin /= 10**padding
+            emax *= 10**padding
+        bounds.append((emin, emax))
+    emin = min(bound[0] for bound in bounds)
+    emax = max(bound[1] for bound in bounds)
+    tables = [
+        c.shape
+        for c in source.components.values()
+        if c.shape.name == "TabulatedSpectrum"
+    ]
+    if tables:
+        lower = max(t.energy_bounds[0].to_value(u.MeV) for t in tables)
+        upper = min(t.energy_bounds[1].to_value(u.MeV) for t in tables)
+        if lower > emin or upper < emax:
+            raise ValueError(
+                f"Isotropic tables must cover {emin:g}--{emax:g} MeV, including the energy-dispersion margin"
+            )
+        emin, emax = lower, upper
+    else:
+        emin, emax = min(emin, 10**0.5), max(emax, 10**6.5)
+    n_points = max(2, int(np.ceil(100 * np.log10(emax / emin))) + 1)
+    energies = np.geomspace(emin, emax, n_points)
+    for table in tables:
+        knots = np.asarray(table._table["energy_keV"]) / 1000.0
+        energies = np.unique(
+            np.concatenate((energies, knots[(knots >= emin) & (knots <= emax)]))
+        )
+    intensity = _isotropic_dnde(source, energies * 1000.0)
+    directory = str(sanitize_filename(configuration["fileio"]["outdir"], True))
+    os.makedirs(directory, exist_ok=True)
+    tag = get_unique_deterministic_tag(repr((energies.tolist(), intensity.tolist())))
+    filename = os.path.join(directory, f"{source.name}_{tag}_isotropic.txt")
+    np.savetxt(filename, np.column_stack((energies, intensity)))
+    return {
+        "name": source.name,
+        "SpatialModel": "ConstantValue",
+        "SpectrumType": "FileFunction",
+        "Spectrum_Filename": filename,
+    }
+
+
+def _isotropic_dnde(source, energies_keV):
+    """Convert full-sky differential flux to intensity per MeV per steradian."""
+    intensity = (
+        np.asarray(source.get_spatially_integrated_flux(energies_keV), dtype=float)
+        * 1000.0
+        / (4 * np.pi)
+    )
+    if not np.all(np.isfinite(intensity)) or np.any(intensity < 0):
+        raise ValueError(f"Isotropic source {source.name} returned invalid intensities")
+    return np.maximum(intensity, 1e-300)
+
+
+def _get_fermipy_instance(
+    configuration,
+    likelihood_model,
+    exclude_sources=None,
+    galactic_diffuse="default",
+    isotropic_diffuse="default",
+    isotropic_spectrum=None,
+):
     """Generate a 'model' configuration section for fermipy starting from a
     likelihood model from astromodels.
 
@@ -98,9 +302,11 @@ def _get_fermipy_instance(configuration, likelihood_model):
         fermipy
     :param likelihood_model: the input likelihood model from astromodels
     :type likelihood_model: astromodels.Model
-    :return: a dictionary with the 'model' section of the fermipy
-        configuration
+    :return: the GTAnalysis instance and the common non-isotropic FileFunction
+        energy grid in keV (None when no such sources are present)
     """
+
+    excluded_sources = frozenset(exclude_sources or ())
 
     # Generate a new 'model' section in the configuration which reflects the model
     # provided as input
@@ -141,18 +347,21 @@ def _get_fermipy_instance(configuration, likelihood_model):
     # analysis a lot)
     # NOTE: these are going to be absolute paths
 
-    galactic_template = str(
-        sanitize_filename(
-            findGalacticTemplate(irfs, ra_center, dec_center, roi_radius),
-            True,
+    if galactic_diffuse == "default":
+        fermipy_model["galdiff"] = str(
+            sanitize_filename(
+                findGalacticTemplate(irfs, ra_center, dec_center, roi_radius), True
+            )
         )
-    )
-    isotropic_template = str(sanitize_filename(findIsotropicTemplate(irfs), True))
-
-    # Add them to the fermipy model
-
-    fermipy_model["galdiff"] = galactic_template
-    fermipy_model["isodiff"] = isotropic_template
+    if isotropic_diffuse == "default":
+        if isotropic_spectrum is None:
+            fermipy_model["isodiff"] = str(
+                sanitize_filename(findIsotropicTemplate(irfs), True)
+            )
+        else:
+            fermipy_model["isodiff"] = _prepare_isotropic_spectrum(
+                isotropic_spectrum, configuration
+            )
 
     # Now iterate over all sources contained in the likelihood model
     sources = []
@@ -161,6 +370,9 @@ def _get_fermipy_instance(configuration, likelihood_model):
     for point_source in list(
         likelihood_model.point_sources.values()
     ):  # type: astromodels.PointSource
+        if point_source.name in excluded_sources:
+            continue
+
         this_source = {
             "Index": 2.56233,
             "Scale": 572.78,
@@ -180,6 +392,9 @@ def _get_fermipy_instance(configuration, likelihood_model):
     for extended_source in list(
         likelihood_model.extended_sources.values()
     ):  # type: astromodels.ExtendedSource
+        if extended_source.name in excluded_sources:
+            continue
+
         this_source = {
             "Index": 2.56233,
             "Scale": 572.78,
@@ -220,6 +435,19 @@ def _get_fermipy_instance(configuration, likelihood_model):
             this_source["SpatialModel"] = "SpatialMap"
             this_source["Spatial_Filename"] = theShape._fitsfile
 
+        elif _is_mapcube(extended_source):
+            # MapCubeSource supplies a flat PowerLaw multiplier. The cube itself
+            # carries both the morphology and the spectrum.
+            this_source = {
+                "name": extended_source.name,
+                "SpatialModel": "MapCubeFunction",
+                "Spatial_Filename": _mapcube_filename(extended_source),
+                "SpectrumType": "PowerLaw",
+            }
+
+        elif theShape.name == "Isotropic_on_sphere":
+            this_source = _isotropic_config(extended_source, configuration)
+
         else:
             log.critical(
                 f"Extended source {extended_source.name}: shape {theShape.name} not yet"
@@ -247,6 +475,9 @@ def _get_fermipy_instance(configuration, likelihood_model):
     for point_source in list(
         likelihood_model.point_sources.values()
     ):  # type: astromodels.PointSource
+        if point_source.name in excluded_sources:
+            continue
+
         # This will substitute the current spectrum with a FileFunction with the same
         # shape and flux
         gta.set_source_spectrum(point_source.name, "FileFunction", update_source=False)
@@ -255,7 +486,7 @@ def _get_fermipy_instance(configuration, likelihood_model):
         this_log_energies, _flux = gta.get_source_dnde(point_source.name)
         this_energies_keV = (
             10**this_log_energies * 1e3
-        )  # fermipy energies are in GeV, we need keV
+        )  # fermipy energies are in MeV, we need keV
 
         if energies_keV is None:
             energies_keV = this_energies_keV
@@ -269,13 +500,59 @@ def _get_fermipy_instance(configuration, likelihood_model):
         dnde = point_source(energies_keV)  # ph / (cm2 s keV)
         dnde_per_MeV = np.maximum(dnde * 1000.0, 1e-300)  # ph / (cm2 s MeV)
         gta.set_source_dnde(point_source.name, dnde_per_MeV, False)
-
+        
+        # Synchronize Fermipy parameter freedom with astromodels
+        gta.free_source(
+            point_source.name,
+            free=point_source.has_free_parameters
+        )
+        
     # Same for extended source
     for extended_source in list(
         likelihood_model.extended_sources.values()
     ):  # type: astromodels.ExtendedSource
+        if extended_source.name in excluded_sources:
+            continue
+
         # This will substitute the current spectrum with a FileFunction with the same
         # shape and flux
+
+        theShape = extended_source.spatial_shape
+
+        if _is_mapcube(extended_source):
+            _update_mapcube_tilt(gta, extended_source)
+            gta.set_norm_bounds(
+                extended_source.name,
+                (
+                    (
+                        0.0
+                        if theShape.K.min_value is None
+                        else float(theShape.K.min_value)
+                    ),
+                    (
+                        max(1000.0, float(theShape.K.value))
+                        if theShape.K.max_value is None
+                        else float(theShape.K.max_value)
+                    ),
+                ),
+            )
+            gta.set_norm(
+                extended_source.name, float(theShape.K.value), update_source=False
+            )
+            gta.free_source(extended_source.name, free=False)
+            continue
+
+        if theShape.name == "Isotropic_on_sphere":
+            # This FileFunction already has a source-specific energy grid.
+            # Its spectrum is an intensity, not an all-sky integrated flux.
+            log_energies, _ = gta.get_source_dnde(extended_source.name)
+            gta.set_source_dnde(
+                extended_source.name,
+                _isotropic_dnde(extended_source, 10**log_energies * 1000.0),
+                update_source=False,
+            )
+            continue
+
         gta.set_source_spectrum(
             extended_source.name, "FileFunction", update_source=False
         )
@@ -284,7 +561,7 @@ def _get_fermipy_instance(configuration, likelihood_model):
         this_log_energies, _flux = gta.get_source_dnde(extended_source.name)
         this_energies_keV = (
             10**this_log_energies * 1e3
-        )  # fermipy energies are in GeV, we need keV
+        )  # fermipy energies are in MeV, we need keV
 
         if energies_keV is None:
             energies_keV = this_energies_keV
@@ -331,13 +608,78 @@ class FermipyLike(PluginPrototype):
 
         return instance
 
-    def __init__(self, name, fermipy_config):
+    def __init__(
+        self,
+        name,
+        fermipy_config,
+        exclude_sources=None,
+        skip_source_diagnostics=False,
+        galactic_diffuse="default",
+        isotropic_diffuse="default",
+        isotropic_spectrum=None,
+    ):
         """
         :param name: a name for this instance
         :param fermipy_config: either a path to a YAML configuration file or a
         dictionary containing the configuration
         (see http://fermipy.readthedocs.io/)
+        :param galactic_diffuse: "default" for the standard LAT Galactic template,
+            None to omit it, or a sequence of shared-model extended-source names
+            replacing it (for example ["ic", "pi0"]).
+        :param isotropic_diffuse: "default" for the standard LAT isotropic template,
+            None to omit it, or a sequence of shared-model Isotropic_on_sphere
+            source names replacing it. Custom parameters belong to astromodels.
+        :param isotropic_spectrum: optional path to a native LAT ASCII spectrum,
+            with energy in MeV and differential intensity in
+            ph / (cm2 s sr MeV) in the first two columns. Replaces the default
+            isotropic file; its normalization remains a LAT nuisance parameter.
+            Requires isotropic_diffuse="default". No unit conversion or
+            renormalization is applied. The table must cover the LAT energies,
+            including the energy-dispersion margin when enabled.
+        :param exclude_sources: optional sequence of shared-model source names
+            to omit from LAT only. The shared model is not modified. Unknown
+            names raise ValueError when the model is attached. Use a fresh
+            output directory if overriding fileio.outdir after changing this list.
+        :param skip_source_diagnostics: if True, update spectra and parameters
+            without automatic Fermipy TS/normalization-profile diagnostics.
+            A sequence of shared-model source names skips diagnostics only for
+            those sources. Unknown names raise ValueError at model attachment.
+            This does not disable source emission or change parameter freedom.
+            Explicit Fermipy diagnostic calls are unaffected. Default False
+            preserves the original update behavior.
         """
+
+        self._excluded_sources = frozenset(
+            _source_names(
+                () if exclude_sources is None else exclude_sources, "exclude_sources"
+            )
+        )
+        if not isinstance(skip_source_diagnostics, bool):
+            skip_source_diagnostics = frozenset(
+                _source_names(skip_source_diagnostics, "skip_source_diagnostics")
+            )
+        self._skip_source_diagnostics = skip_source_diagnostics
+        # Sources verified free on the LAT side (see _ensure_free_on_lat).
+        self._lat_free_checked = set()
+        self._galactic_diffuse = _diffuse_selection(galactic_diffuse, "galactic_diffuse")
+        self._isotropic_diffuse = _diffuse_selection(isotropic_diffuse, "isotropic_diffuse")
+        self._isotropic_spectrum = None
+        if isotropic_spectrum is not None:
+            if self._isotropic_diffuse != "default":
+                raise ValueError(
+                    'isotropic_spectrum requires isotropic_diffuse="default"; '
+                    "it cannot be combined with a disabled or shared-model background"
+                )
+            self._isotropic_spectrum = str(
+                sanitize_filename(os.fspath(isotropic_spectrum), True)
+            )
+            _read_isotropic_spectrum(self._isotropic_spectrum)
+        self._default_diffuse_sources = []
+        if self._galactic_diffuse == "default":
+            self._default_diffuse_sources.append("galdiff")
+        if self._isotropic_diffuse == "default":
+            self._default_diffuse_sources.append("isodiff")
+        self._isotropic_energies = {}
 
         # There are no nuisance parameters
 
@@ -352,9 +694,7 @@ class FermipyLike(PluginPrototype):
             configuration_file = sanitize_filename(fermipy_config)
 
             if not os.path.exists(fermipy_config):
-                log.critical(
-                    "Configuration file %s does not exist" % configuration_file
-                )
+                log.critical("Configuration file %s does not exist" % configuration_file)
 
             # Read the configuration
             with open(configuration_file) as f:
@@ -362,7 +702,7 @@ class FermipyLike(PluginPrototype):
 
         else:
             # Configuration is a dictionary. Nothing to do
-            self._configuration = fermipy_config
+            self._configuration = copy.deepcopy(fermipy_config)
 
         # If the user provided a 'model' key, issue a warning, as the model will be
         # defined later on and will overwrite the one contained in 'model'
@@ -407,9 +747,27 @@ class FermipyLike(PluginPrototype):
         # configuration, so that the same configuration will write in the same directory
         # and fermipy will know that it doesn't need to recompute things
 
-        self._unique_id = "__%s" % _get_unique_tag_from_configuration(
-            self._configuration
-        )
+        self._unique_id = "__%s" % _get_unique_tag_from_configuration(self._configuration)
+
+        # Source selection changes the LAT source maps. Keep the original tag
+        # unchanged unless exclusions were explicitly requested.
+        if (
+            self._excluded_sources
+            or self._galactic_diffuse != "default"
+            or self._isotropic_diffuse != "default"
+        ):
+            self._unique_id += "_" + get_unique_deterministic_tag(
+                repr(
+                    (
+                        sorted(self._excluded_sources),
+                        self._galactic_diffuse,
+                        self._isotropic_diffuse,
+                    )
+                )
+            )
+        if self._isotropic_spectrum is not None:
+            self._unique_id += "_" + get_unique_deterministic_tag(self._isotropic_spectrum)
+        self._automatic_outdir = self._unique_id
 
         self._configuration["fileio"] = {"outdir": self._unique_id}
 
@@ -568,11 +926,123 @@ class FermipyLike(PluginPrototype):
         # This will take a long time if it's the first time we run, as it will select
         # the data, produce livetime cube, expomap, source maps and so on
 
+        unknown_sources = self._excluded_sources.difference(
+            likelihood_model_instance.sources
+        )
+        if unknown_sources:
+            raise ValueError(
+                "Excluded sources are not in the shared model: "
+                + ", ".join(sorted(unknown_sources))
+            )
+
+        if not isinstance(self._skip_source_diagnostics, bool):
+            unknown_sources = self._skip_source_diagnostics.difference(
+                likelihood_model_instance.sources
+            )
+            if unknown_sources:
+                raise ValueError(
+                    "Sources selected to skip diagnostics are not in the shared model: "
+                    + ", ".join(sorted(unknown_sources))
+                )
+
+        custom_galactic = (
+            () if self._galactic_diffuse in (None, "default") else self._galactic_diffuse
+        )
+        custom_isotropic = (
+            () if self._isotropic_diffuse in (None, "default") else self._isotropic_diffuse
+        )
+        overlap = set(custom_galactic).intersection(custom_isotropic)
+        if overlap:
+            raise ValueError(
+                "A source cannot replace both Galactic and isotropic backgrounds"
+            )
+        for names, kind in ((custom_galactic, "Galactic"), (custom_isotropic, "isotropic")):
+            for name in names:
+                if name not in likelihood_model_instance.extended_sources:
+                    raise ValueError(
+                        f"Custom {kind} source {name} must be an extended source in the model"
+                    )
+                if name in self._excluded_sources:
+                    raise ValueError(
+                        f"Custom {kind} source {name} cannot also be excluded from LAT"
+                    )
+                shape = likelihood_model_instance.extended_sources[name].spatial_shape
+                if kind == "isotropic" and shape.name != "Isotropic_on_sphere":
+                    raise ValueError(
+                        f"Custom isotropic source {name} must use Isotropic_on_sphere"
+                    )
+        components = self._configuration.get("components") or []
+        if isinstance(components, dict):
+            components = list(components.values())
+        for component in components:
+            overrides = component.get("model", {})
+            for key, selection in (
+                ("galdiff", self._galactic_diffuse),
+                ("isodiff", self._isotropic_diffuse),
+            ):
+                custom_file = key == "isodiff" and self._isotropic_spectrum is not None
+                if (selection != "default" or custom_file) and key in overrides:
+                    raise ValueError(
+                        f"Remove component-specific {key} overrides when selecting custom or disabled diffuse emission"
+                    )
+            if (
+                self._galactic_diffuse != "default"
+                or self._isotropic_diffuse != "default"
+                or self._isotropic_spectrum is not None
+            ) and any(key in overrides for key in ("sources", "diffuse", "diffuse_xml")):
+                raise ValueError(
+                    "Component-specific source overrides are not supported with custom diffuse selections"
+                )
+
+        for name in self._default_diffuse_sources:
+            if (
+                name in likelihood_model_instance.sources
+                and name not in self._excluded_sources
+            ):
+                raise ValueError(
+                    f"Source name {name} conflicts with an automatic LAT background"
+                )
+
+        # Include mapcube identities when choosing an automatic output directory.
+        # A caller-provided output directory remains the caller's responsibility.
+        identities = []
+        if self._isotropic_spectrum is not None:
+            table = _read_isotropic_spectrum(self._isotropic_spectrum)
+            identities.append(
+                ("isodiff", get_unique_deterministic_tag(repr(table.tolist())))
+            )
+        for source in likelihood_model_instance.extended_sources.values():
+            if source.name in self._excluded_sources:
+                continue
+            if _is_mapcube(source):
+                filename = _mapcube_filename(source)
+                stat = os.stat(filename)
+                identities.append((source.name, filename, stat.st_size, stat.st_mtime_ns))
+            elif source.spatial_shape.name == "Isotropic_on_sphere":
+                identities.append((source.name, repr(source.to_dict())))
+        if identities and self._configuration["fileio"]["outdir"] == self._automatic_outdir:
+            self._automatic_outdir = (
+                self._unique_id + "_" + get_unique_deterministic_tag(repr(identities))
+            )
+            self._configuration["fileio"]["outdir"] = self._automatic_outdir
+
         self._likelihood_model = likelihood_model_instance
 
+        self._lat_free_checked = set()
         self._gta, self._pts_energies = _get_fermipy_instance(
-            self._configuration, likelihood_model_instance
+            self._configuration,
+            likelihood_model_instance,
+            exclude_sources=self._excluded_sources,
+            galactic_diffuse=self._galactic_diffuse,
+            isotropic_diffuse=self._isotropic_diffuse,
+            isotropic_spectrum=self._isotropic_spectrum,
         )
+        self._isotropic_energies = {
+            source.name: 10 ** self._gta.get_source_dnde(source.name)[0] * 1000.0
+            for source in likelihood_model_instance.extended_sources.values()
+            if source.name not in self._excluded_sources
+            and source.spatial_shape.name == "Isotropic_on_sphere"
+        }
         self._update_model_in_fermipy(update_dictionary=True, force_update=True)
 
         # Build the list of the nuisance parameters
@@ -582,14 +1052,33 @@ class FermipyLike(PluginPrototype):
     def _update_model_in_fermipy(
         self, update_dictionary=False, delta=0.0, force_update=False
     ):
+        # Spectrum/position updates and expensive source diagnostics are separate.
+        # Refresh only parameter metadata below when diagnostics are disabled.
+        if self._skip_source_diagnostics is True:
+            diagnostic_skip_sources = set(self._likelihood_model.sources)
+        elif self._skip_source_diagnostics is False:
+            diagnostic_skip_sources = set()
+        else:
+            diagnostic_skip_sources = self._skip_source_diagnostics
+
         # Substitute all spectra for point sources with FileSpectrum, so that we will be
         # able to control them from 3ML
         for point_source in list(
             self._likelihood_model.point_sources.values()
         ):  # type: astromodels.PointSource
+            if point_source.name in self._excluded_sources:
+                continue
+
+            update_source_dictionary = (
+                update_dictionary and point_source.name not in diagnostic_skip_sources
+            )
+
             # Update this source only if it has free parameters (to gain time)
             if not (point_source.has_free_parameters or force_update):
                 continue
+
+            if point_source.has_free_parameters:
+                self._ensure_free_on_lat(point_source.name)
 
             # Update source position if free
             if force_update or (
@@ -609,7 +1098,7 @@ class FermipyLike(PluginPrototype):
                     self._gta.set_source_spectrum(
                         point_source.name,
                         "FileFunction",
-                        update_source=update_dictionary,
+                        update_source=update_source_dictionary,
                     )
 
             # Now set the spectrum of this source to the right one
@@ -621,18 +1110,64 @@ class FermipyLike(PluginPrototype):
             # update fermipy dictionaries.)
 
             self._gta.set_source_dnde(
-                point_source.name, dnde_MeV, update_source=update_dictionary
+                point_source.name, dnde_MeV, update_source=update_source_dictionary
             )
 
         # Same for extended source
         for extended_source in list(
             self._likelihood_model.extended_sources.values()
         ):  # type: astromodels.ExtendedSource
+            if extended_source.name in self._excluded_sources:
+                continue
+
+            update_source_dictionary = (
+                update_dictionary and extended_source.name not in diagnostic_skip_sources
+            )
+
             # Update this source only if it has free parameters (to gain time)
             if not (extended_source.has_free_parameters or force_update):
                 continue
 
             theShape = extended_source.spatial_shape
+
+            if _is_mapcube(extended_source):
+
+                # 3ML/astromodels owns K.
+                # Fermipy evaluates the mapcube with its optional spectral tilt.
+                _update_mapcube_tilt(self._gta, extended_source)
+                self._gta.set_norm(
+                    extended_source.name,
+                    float(theShape.K.value),
+                    update_source=update_source_dictionary,
+                )
+
+                # The mapcube is fixed on the LAT side, so the Science Tools
+                # add it to their cached fixed-source model, which is rebuilt
+                # inside logLike.value() *before* each source's energy-
+                # dispersion correction (Drm_Cache) is refreshed for its new
+                # spectrum. Without this call a change of spectral shape (the
+                # tilt index) would be evaluated with the previous call's
+                # correction, making the likelihood depend on the previous
+                # parameter values. NpredValue refreshes the correction now.
+                for component in self._gta.components:
+                    component.like.logLike.NpredValue(str(extended_source.name))
+
+                continue
+
+            # Everything below reaches the LAT as a FileFunction table.
+            if extended_source.has_free_parameters:
+                self._ensure_free_on_lat(extended_source.name)
+
+            if theShape.name == "Isotropic_on_sphere":
+                self._gta.set_source_dnde(
+                    extended_source.name,
+                    _isotropic_dnde(
+                        extended_source, self._isotropic_energies[extended_source.name]
+                    ),
+                    update_source=update_source_dictionary,
+                )
+                continue
+
             if theShape.has_free_parameters or force_update:
                 fermipySource = self._gta.roi.get_source_by_name(extended_source.name)
                 fermipyPars = [
@@ -659,14 +1194,12 @@ class FermipyLike(PluginPrototype):
                         )
                         # from fermipy: FIXME: Issue with source map cache with source
                         # is initialized as fixed.
-                        self._gta.add_source(
-                            extended_source.name, temp_source, free=True
-                        )
+                        self._gta.add_source(extended_source.name, temp_source, free=True)
                         self._gta.free_source(extended_source.name, free=False)
                         self._gta.set_source_spectrum(
                             extended_source.name,
                             "FileFunction",
-                            update_source=update_dictionary,
+                            update_source=update_source_dictionary,
                         )
 
                 elif theShape.name == "Gaussian_on_sphere":
@@ -687,14 +1220,12 @@ class FermipyLike(PluginPrototype):
                         )
                         # from fermipy: FIXME: Issue with source map cache with source
                         # is initialized as fixed.
-                        self._gta.add_source(
-                            extended_source.name, temp_source, free=True
-                        )
+                        self._gta.add_source(extended_source.name, temp_source, free=True)
                         self._gta.free_source(extended_source.name, free=False)
                         self._gta.set_source_spectrum(
                             extended_source.name,
                             "FileFunction",
-                            update_source=update_dictionary,
+                            update_source=update_source_dictionary,
                         )
 
                 elif theShape.name == "SpatialTemplate_2D":
@@ -715,8 +1246,48 @@ class FermipyLike(PluginPrototype):
             # (HF: Not sure who wrote the above but I think sometimes we do want to
             # update fermipy dictionaries.)
             self._gta.set_source_dnde(
-                extended_source.name, dnde_MeV, update_source=update_dictionary
+                extended_source.name, dnde_MeV, update_source=update_source_dictionary
             )
+
+        if update_dictionary:
+            for source_name in list(self._likelihood_model.point_sources) + list(
+                self._likelihood_model.extended_sources
+            ):
+                if (
+                    source_name not in self._excluded_sources
+                    and source_name in diagnostic_skip_sources
+                ):
+                    self._gta.update_source(source_name, paramsonly=True)
+
+    def _ensure_free_on_lat(self, name):
+        """Make sure a FileFunction source whose 3ML parameters are free is
+        also free on the LAT side.
+
+        3ML changes such a source by replacing its FileFunction table
+        (set_source_dnde), which changes no LAT parameter. The Science Tools
+        detect changes to fixed sources only by comparing parameter values
+        (SourceMap::spectrum_changed), so a fixed source's new table would
+        never enter the cached fixed-source model: the likelihood would ignore
+        it. This happens if a parameter is freed in 3ML after the plugin was
+        set up. Freeing the source's normalization on the LAT side moves it to
+        the free sources, which are recomputed on every evaluation. (3ML still
+        owns the value; nothing on the LAT side is fitted.)
+        """
+        if name in self._lat_free_checked:
+            return
+        if not self._gta.get_free_source_params(name):
+            log.warning(
+                f"{name} has free 3ML parameters but was fixed on the LAT side "
+                "(freed after the LAT setup?); freeing its LAT normalization so "
+                "that its spectrum enters the likelihood."
+            )
+            self._gta.free_source(name, free=True, pars="norm")
+            if not self._gta.get_free_source_params(name):
+                raise RuntimeError(
+                    f"Could not free {name} on the LAT side; its spectral changes "
+                    "would be ignored by the LAT likelihood."
+                )
+        self._lat_free_checked.add(name)
 
     def get_log_like(self):
         """Return the value of the log-likelihood with the current values for
@@ -791,10 +1362,9 @@ class FermipyLike(PluginPrototype):
 
     def _set_nuisance_parameters(self):
         # Get the list of the sources
-        sources = list(self.gta.roi.get_sources())
-        sources = [s.name for s in sources if "diff" in s.name]
+        sources = self._default_diffuse_sources
 
-        bg_param_names = []
+        self._nuisance_parameter_map = {}
         nuisance_parameters = collections.OrderedDict()
 
         for src_name in sources:
@@ -805,7 +1375,7 @@ class FermipyLike(PluginPrototype):
 
             for par in pars:
                 thisName = f"{self.name}_{src_name}_{par}"
-                bg_param_names.append(thisName)
+                self._nuisance_parameter_map[thisName] = (src_name, par)
 
                 thePar = self.gta._get_param(src_name, par)
 
@@ -827,11 +1397,7 @@ class FermipyLike(PluginPrototype):
         return nuisance_parameters
 
     def _split_nuisance_parameter(self, param_name):
-        tokens = param_name.split("_")
-        pname = tokens[-1]
-        src_name = "_".join(tokens[1:-1])
-
-        return src_name, pname
+        return self._nuisance_parameter_map[param_name]
 
     def set_nuisance_parameter_value(self, paramName, value):
         srcName, parName = self._split_nuisance_parameter(paramName)
