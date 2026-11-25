@@ -1135,6 +1135,17 @@ class FermipyLike(PluginPrototype):
                     update_source=update_source_dictionary,
                 )
 
+                # The mapcube is fixed on the LAT side, so the Science Tools
+                # add it to their cached fixed-source model, which is rebuilt
+                # inside logLike.value() *before* each source's energy-
+                # dispersion correction (Drm_Cache) is refreshed for its new
+                # spectrum. Without this call a change of spectral shape (the
+                # tilt index) would be evaluated with the previous call's
+                # correction, making the likelihood depend on the previous
+                # parameter values. NpredValue refreshes the correction now.
+                for component in self._gta.components:
+                    component.like.logLike.NpredValue(str(extended_source.name))
+
                 continue
 
             if theShape.name == "Isotropic_on_sphere":
