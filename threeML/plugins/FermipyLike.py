@@ -659,6 +659,8 @@ class FermipyLike(PluginPrototype):
                 _source_names(skip_source_diagnostics, "skip_source_diagnostics")
             )
         self._skip_source_diagnostics = skip_source_diagnostics
+        # Sources verified free on the LAT side (see _ensure_free_on_lat).
+        self._lat_free_checked = set()
         self._galactic_diffuse = _diffuse_selection(galactic_diffuse, "galactic_diffuse")
         self._isotropic_diffuse = _diffuse_selection(isotropic_diffuse, "isotropic_diffuse")
         self._isotropic_spectrum = None
@@ -1026,6 +1028,7 @@ class FermipyLike(PluginPrototype):
 
         self._likelihood_model = likelihood_model_instance
 
+        self._lat_free_checked = set()
         self._gta, self._pts_energies = _get_fermipy_instance(
             self._configuration,
             likelihood_model_instance,
@@ -1073,6 +1076,9 @@ class FermipyLike(PluginPrototype):
             # Update this source only if it has free parameters (to gain time)
             if not (point_source.has_free_parameters or force_update):
                 continue
+
+            if point_source.has_free_parameters:
+                self._ensure_free_on_lat(point_source.name)
 
             # Update source position if free
             if force_update or (
@@ -1135,7 +1141,22 @@ class FermipyLike(PluginPrototype):
                     update_source=update_source_dictionary,
                 )
 
+                # The mapcube is fixed on the LAT side, so the Science Tools
+                # add it to their cached fixed-source model, which is rebuilt
+                # inside logLike.value() *before* each source's energy-
+                # dispersion correction (Drm_Cache) is refreshed for its new
+                # spectrum. Without this call a change of spectral shape (the
+                # tilt index) would be evaluated with the previous call's
+                # correction, making the likelihood depend on the previous
+                # parameter values. NpredValue refreshes the correction now.
+                for component in self._gta.components:
+                    component.like.logLike.NpredValue(str(extended_source.name))
+
                 continue
+
+            # Everything below reaches the LAT as a FileFunction table.
+            if extended_source.has_free_parameters:
+                self._ensure_free_on_lat(extended_source.name)
 
             if theShape.name == "Isotropic_on_sphere":
                 self._gta.set_source_dnde(
@@ -1237,6 +1258,36 @@ class FermipyLike(PluginPrototype):
                     and source_name in diagnostic_skip_sources
                 ):
                     self._gta.update_source(source_name, paramsonly=True)
+
+    def _ensure_free_on_lat(self, name):
+        """Make sure a FileFunction source whose 3ML parameters are free is
+        also free on the LAT side.
+
+        3ML changes such a source by replacing its FileFunction table
+        (set_source_dnde), which changes no LAT parameter. The Science Tools
+        detect changes to fixed sources only by comparing parameter values
+        (SourceMap::spectrum_changed), so a fixed source's new table would
+        never enter the cached fixed-source model: the likelihood would ignore
+        it. This happens if a parameter is freed in 3ML after the plugin was
+        set up. Freeing the source's normalization on the LAT side moves it to
+        the free sources, which are recomputed on every evaluation. (3ML still
+        owns the value; nothing on the LAT side is fitted.)
+        """
+        if name in self._lat_free_checked:
+            return
+        if not self._gta.get_free_source_params(name):
+            log.warning(
+                f"{name} has free 3ML parameters but was fixed on the LAT side "
+                "(freed after the LAT setup?); freeing its LAT normalization so "
+                "that its spectrum enters the likelihood."
+            )
+            self._gta.free_source(name, free=True, pars="norm")
+            if not self._gta.get_free_source_params(name):
+                raise RuntimeError(
+                    f"Could not free {name} on the LAT side; its spectral changes "
+                    "would be ignored by the LAT likelihood."
+                )
+        self._lat_free_checked.add(name)
 
     def get_log_like(self):
         """Return the value of the log-likelihood with the current values for
